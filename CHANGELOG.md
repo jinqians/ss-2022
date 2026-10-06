@@ -1,5 +1,40 @@
 # 更新日志
 
+## v5.0（2026-10-07）
+
+ss-2022.sh 2.0 → 3.0，block-mainland.sh 1.1 → 2.0；menu.sh、shadowtls.sh 换成 jinqians/snell 的同名脚本（4.6）
+
+### 跟进 shadowsocks-rust 1.22 – 1.25
+- **单端口多用户**（1.25 的 Extensible Identity Header）：几个人共用一个端口、各用各的密钥，可以单独删人、换密钥。只支持 `2022-blake3-aes-128-gcm` / `aes-256-gcm`。ssserver 只在 `servers` 数组里认用户，所以 `config.json` 仍保持单服务器格式（PSM、ShadowTLS 与大陆屏蔽都按它读端口），有用户时另外生成 `config-eih.json` 给主服务跑。
+- **出口代理**（1.25）：服务器的出站 TCP 经 SOCKS5 / HTTP / HTTPS 代理（可多跳）；设置时从服务器经代理试连并显示出口 IP。UDP 不经代理。
+- **日志**（1.24）：级别；另写到 `/var/log/ss-rust/`，按天分文件、保留 7 个。
+- **入站 UDP 分片**（1.25 起默认不分片）：在「修改配置」里可以打开。
+- 加密方式菜单去掉了官方发布版不支持的 `2022-blake3-chacha8-poly1305`（选了它服务就起不来）和不安全的流加密；已经在用的配置照常能跑。
+
+### 安装
+- 装官方发布的静态链接版（musl），不再依赖系统的 glibc；下载到临时目录，核对官方的 SHA-256 后才换上（以前下到当前目录、不校验，还关了证书检查）。
+- armv7 以前总是装成软浮点的 `arm-gnueabi` 版（检测写成了在 /proc/cpuinfo 里找 `gnueabihf`，永远找不到）。现在按 CPU 选 armv7 / arm / aarch64 / x86_64 / i686 / riscv64 / loongarch64。
+- 不再把时区改成 Asia/Shanghai（2022 系列校验的是时间戳，与时区无关；开时间同步就够了）。
+- **Alpine**（OpenRC）：用 `sh` 运行时脚本自己装 bash；服务、日志、屏蔽中国大陆都支持 OpenRC。
+- 管理命令 `ssrust` 每次运行都取最新的脚本，取不到时用本机保存的那份；旧版的 `ssrust`（链接）打开菜单时自动换成新的。
+- 配置里不再写 `"user": "nobody"`：ssserver 在配置文件里不认这个键，从来没有降过权限。
+
+### 菜单与结构
+- 菜单换成与 PSM、snell 一致的样子：顶上是状态栏（服务、IP、版本、加密方式、端口、用户、ShadowTLS、出口、大陆屏蔽），下面两列的选项，0 退出。
+- 代码拆成模块：`src/ss-2022.sh`、`src/block-mainland.sh` 与 `src/lib/`，由 `tools/build.sh` 合成根目录的单个文件（raw 地址不变）。与 snell 共用的系统识别、装包、防火墙、公网地址，以及 `shadowtls.sh`、`menu.sh`，由 `tools/sync-shared.sh` 从 snell 仓库拷过来，两边是同一份。
+- 改配置只改动那一项，别的键原样保留；改主端口时防火墙、ShadowTLS 的后端、大陆屏蔽的规则跟着改。
+- 卸载时问是否一起删 ShadowTLS（shadowtls-ss）与大陆屏蔽，端口都关掉。
+
+### 屏蔽中国大陆（block-mainland.sh 2.0）
+- IP 库直接下纯文本的 CIDR 列表（IPv4 与旧版同一份数据），不再需要 Python、pip、maxminddb 与编译工具；新增 IPv6（china-operator-ip）。
+- 用 `ipset restore` 一次导入（以前每行起一个 `xargs`，七千多行要很久）。
+- 开机恢复支持 OpenRC；定时更新用 systemd 定时器或 Alpine 的 `/etc/periodic`，不再依赖 cron 软件包。
+- 「更新 IP 库」在屏蔽关着时只更新文件，不会替你打开。
+- 旧版存进 `/etc/iptables/rules.v4` 的屏蔽规则会让 netfilter-persistent 开机恢复整个失败（集合那时还不存在）：只删掉这几行。
+
+### ShadowTLS
+- 监听地址：内核能双栈（有 IPv6、`bindv6only=0`）时 `::0`，否则 `0.0.0.0`（v4.4 的 #13 修复在双栈机器上丢了 IPv6 入口）；读服务文件不再用 BusyBox 没有的 `grep -P`。
+
 ## v4.4（2026-08-25）
 
 ss-2022.sh 1.9 → 2.0，menu.sh 4.3 → 4.4，block-mainland.sh 1.0 → 1.1

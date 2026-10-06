@@ -1,935 +1,811 @@
 #!/usr/bin/env bash
-set -e
-
+# 此文件由 tools/build.sh 从 src/block-mainland.sh 和 src/lib 生成：请修改 src/ 下的文件后重新生成。
 # =========================================
 # 作者: jinqians
-# 日期: 2025年4月
-# 描述: 屏蔽中国大陆连接 Shadowsocks Rust 脚本
+# 网站：jinqians.com
+# 描述: 屏蔽中国大陆来源到 Shadowsocks Rust / ShadowTLS 端口的连接
 # =========================================
+# 用法：block-mainland.sh [enable|disable|update|status|auto-update-enable [daily|weekly]|auto-update-disable|auto-update-status]
+# 不带参数是菜单。ss-2022.sh 的「屏蔽中国大陆」与多功能菜单都调用它。
 
-# 版本信息
-SCRIPT_VERSION="1.1"
-
-# 脚本路径
-SCRIPT_PATH=$(cd "$(dirname "$0")"; pwd)
-SCRIPT_DIR=$(dirname "${SCRIPT_PATH}")
-SCRIPT_NAME=$(basename "$0")
-SCRIPT_FULL_PATH="$(cd "$(dirname "$0")"; pwd)/$(basename "$0")"
-
-# 配置路径
-INSTALL_DIR="/etc/ss-rust"
+# shellcheck disable=SC2034  # 版本号：看文件就知道是哪一版
+SCRIPT_VERSION="2.0"
 CONFIG_PATH="/etc/ss-rust/config.json"
-IPLIST_DIR="/etc/ss-rust/iprules"
-MAINLAND_IP_FILE="${IPLIST_DIR}/mainland_cn.txt"
-MMDB_FILE="${IPLIST_DIR}/Country.mmdb"
-IPTABLES_RULES="/etc/ss-rust/mainland_cn_rules.sh"
-EXTRACT_SCRIPT="$(cd "$(dirname "$0")"; pwd)/extract-cn-ip-from-mmdb.py"
-AUTO_UPDATE_CRON_FILE="/etc/cron.d/block-mainland-auto-update"
-BOOT_SERVICE_NAME="block-mainland.service"
-BOOT_SERVICE_FILE="/etc/systemd/system/block-mainland.service"
-AUTO_UPDATE_LOG_FILE="/var/log/block-mainland-update.log"
-DAILY_CRON_EXPR="30 4 * * *"
-WEEKLY_CRON_EXPR="30 4 * * 1"
+SS_RAW_BASE="${SS_RAW_BASE:-https://raw.githubusercontent.com/jinqians/ss-2022/main}"
 
-# 颜色定义
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly PLAIN='\033[0m'
-readonly BOLD='\033[1m'
+# ── lib/common.sh ─────────────────────────────────────────────────────────────
+# 所有脚本共用：颜色、root 检查、系统与包管理器、脚本的发布地址。
+# 只用 POSIX sh 的写法：Alpine / Docker 版脚本在 ash、dash 下也要能用。
 
-# 状态提示
-readonly INFO="${GREEN}[信息]${PLAIN}"
-readonly ERROR="${RED}[错误]${PLAIN}"
-readonly WARNING="${YELLOW}[警告]${PLAIN}"
-readonly SUCCESS="${GREEN}[成功]${PLAIN}"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+RESET='\033[0m'
 
-# 检查root权限
+# 脚本的发布地址。短域名（*.jinqians.com）由 Cloudflare 重定向到仓库里的文件：
+# snell / snell-centos / snell-alpine → 根目录，menu / snell-docker / install → scripts/。
+# 菜单里调用的子脚本从 SNELL_RAW_BASE 下的 scripts/、docker/ 取。
+# 脚本自身的更新与管理命令走短域名，运行才会被统计到。
+# 可以用同名环境变量换成镜像地址（测试时指向本地的文件）。
+SNELL_RAW_BASE="${SNELL_RAW_BASE:-https://raw.githubusercontent.com/jinqians/snell/main}"
+SNELL_SCRIPT_URL="${SNELL_SCRIPT_URL:-https://snell.jinqians.com}"                     # snell.sh（Debian / Ubuntu / CentOS / RHEL）
+SNELL_ALPINE_SCRIPT_URL="${SNELL_ALPINE_SCRIPT_URL:-https://snell-alpine.jinqians.com}" # snell-alpine.sh
+SNELL_DOCKER_SCRIPT_URL="${SNELL_DOCKER_SCRIPT_URL:-https://snell-docker.jinqians.com}" # snell-docker.sh
+SNELL_MENU_SCRIPT_URL="${SNELL_MENU_SCRIPT_URL:-https://menu.jinqians.com}"             # menu.sh
+
+# 检查是否以 root 权限运行
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${ERROR} 此脚本需要root权限运行"
+    if [ "$(id -u)" != "0" ]; then
+        printf '%b\n' "${RED}请以 root 权限运行此脚本${RESET}"
         exit 1
     fi
 }
 
-# 检查依赖
-check_dependencies() {
-    echo -e "${INFO} 检查依赖..."
-    
-    local missing_deps=()
-    local missing_python=false
-    
-    # 检查必需的工具
-    for cmd in curl iptables python3; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing_deps+=("$cmd")
+# 识别系统：OS_FAMILY = debian | rhel | alpine | unknown，PKG = apt | dnf | yum | apk
+OS_FAMILY=""
+PKG=""
+detect_os() {
+    [ -n "$OS_FAMILY" ] && return 0
+    OS_FAMILY="unknown"
+    if [ -f /etc/os-release ]; then
+        # 在子 shell 里读，os-release 的 NAME / VERSION 等变量不会覆盖脚本自己的
+        case " $(. /etc/os-release; echo "$ID $ID_LIKE" | tr '[:upper:]' '[:lower:]') " in
+            *" debian "*|*" ubuntu "*) OS_FAMILY="debian" ;;
+            *" rhel "*|*" centos "*|*" fedora "*|*" rocky "*|*" almalinux "*) OS_FAMILY="rhel" ;;
+            *" alpine "*) OS_FAMILY="alpine" ;;
+        esac
+    elif [ -f /etc/redhat-release ]; then
+        OS_FAMILY="rhel"
+    fi
+    if command -v apt-get >/dev/null 2>&1; then PKG="apt"
+    elif command -v dnf >/dev/null 2>&1; then PKG="dnf"
+    elif command -v yum >/dev/null 2>&1; then PKG="yum"
+    elif command -v apk >/dev/null 2>&1; then PKG="apk"
+    fi
+}
+
+# 等待其他 apt 进程完成
+wait_for_apt() {
+    command -v fuser >/dev/null 2>&1 || return 0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1; do
+        printf '%b\n' "${YELLOW}等待其他 apt 进程完成...${RESET}"
+        sleep 2
+    done
+}
+
+# 用系统的包管理器安装软件包
+pkg_install() {
+    detect_os
+    case "$PKG" in
+        apt)
+            wait_for_apt
+            DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+            ;;
+        dnf) dnf install -y "$@" ;;
+        yum) yum install -y "$@" ;;
+        apk) apk add --no-cache "$@" ;;
+        *)
+            printf '%b\n' "${RED}未识别的包管理器，请手动安装：$*${RESET}"
+            return 1
+            ;;
+    esac
+}
+
+# 提供某个命令的软件包名（各发行版不同的在这里对上）
+pkg_for_cmd() {
+    detect_os
+    case "$1" in
+        ip|ss) if [ "$OS_FAMILY" = "rhel" ]; then echo "iproute"; else echo "iproute2"; fi ;;
+        nft) echo "nftables" ;;
+        fuser) echo "psmisc" ;;
+        gpg) if [ "$OS_FAMILY" = "rhel" ]; then echo "gnupg2"; else echo "gnupg"; fi ;;
+        sysctl) if [ "$OS_FAMILY" = "rhel" ]; then echo "procps-ng"; else echo "procps"; fi ;;
+        modprobe) echo "kmod" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# 缺哪个命令就装哪个包；装不上返回非 0，由调用方决定是否退出
+ensure_cmds() {
+    _ec_missing=""
+    for _ec_cmd in "$@"; do
+        command -v "$_ec_cmd" >/dev/null 2>&1 || _ec_missing="${_ec_missing} $(pkg_for_cmd "$_ec_cmd")"
+    done
+    [ -z "$_ec_missing" ] && return 0
+    printf '%b\n' "${YELLOW}正在安装依赖：${_ec_missing# }${RESET}"
+    # shellcheck disable=SC2086 # 包名按空格分开传
+    pkg_install $_ec_missing || return 1
+    for _ec_cmd in "$@"; do
+        if ! command -v "$_ec_cmd" >/dev/null 2>&1; then
+            printf '%b\n' "${RED}安装后仍找不到 ${_ec_cmd}，请手动安装 $(pkg_for_cmd "$_ec_cmd")${RESET}"
+            return 1
         fi
     done
-    
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        echo -e "${WARNING} 缺少依赖: ${missing_deps[*]}"
-        echo -e "${INFO} 正在安装依赖..."
-        
-        if command -v apt-get &> /dev/null; then
-            apt-get update
-            apt-get install -y "${missing_deps[@]}"
-        elif command -v yum &> /dev/null; then
-            yum install -y "${missing_deps[@]}"
-        else
-            echo -e "${ERROR} 无法自动安装依赖，请手动安装后重试"
-            exit 1
-        fi
-    fi
-    
-    # 检查pip
-    echo -e "${INFO} 检查pip..."
-    if ! python3 -m pip --version &>/dev/null; then
-        echo -e "${WARNING} pip未安装，正在安装..."
-        if command -v apt-get &> /dev/null; then
-            apt-get install -y python3-pip
-        elif command -v yum &> /dev/null; then
-            yum install -y python3-pip
-        fi
-    fi
-    
-    # 检查Python maxminddb库
-    echo -e "${INFO} 检查Python maxminddb库..."
-    if ! python3 -c "import maxminddb" 2>/dev/null; then
-        echo -e "${WARNING} 缺少Python库: maxminddb"
-        echo -e "${INFO} 正在安装依赖..."
-        
-        # 先尝试用系统包管理器安装
-        if command -v apt-get &> /dev/null; then
-            if apt-cache search python3-maxminddb | grep -q python3-maxminddb; then
-                echo -e "${INFO} 通过apt安装maxminddb..."
-                apt-get install -y python3-maxminddb 2>/dev/null && echo -e "${SUCCESS} maxminddb库安装成功" && return 0 || true
-            fi
-            
-            # 否则安装编译依赖然后用pip
-            echo -e "${INFO} 安装编译依赖..."
-            apt-get install -y python3-dev build-essential 2>/dev/null || true
-        elif command -v yum &> /dev/null; then
-            echo -e "${INFO} 安装编译依赖..."
-            yum install -y python3-devel gcc 2>/dev/null || true
-        fi
-        
-        # 用pip安装，添加--break-system-packages标志（用于Debian系统）
-        echo -e "${INFO} 安装maxminddb库..."
-        python3 -m pip install --break-system-packages maxminddb 2>&1 | tail -5 && echo -e "${SUCCESS} maxminddb库安装成功" || echo -e "${WARNING} maxminddb库安装可能失败，请手动检查Python环境"
-    fi
-    
-    echo -e "${SUCCESS} 依赖检查完成"
 }
 
-# 创建必要的目录
-create_directories() {
-    echo -e "${INFO} 创建必要的目录..."
-    
-    if [ ! -d "$INSTALL_DIR" ]; then
-        mkdir -p "$INSTALL_DIR"
+# 下载远程脚本并做完整性校验：传输失败即停、非空、语法检查。
+# 只能保证传输完整；仓库本身被篡改要靠发布签名来防。
+fetch_verified_script() {   # <url> <dest>
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 "$1" -o "$2"; then
+        printf '%b\n' "${RED}下载失败: $1${RESET}" >&2
+        rm -f "$2"
+        return 1
     fi
-    
-    if [ ! -d "$IPLIST_DIR" ]; then
-        mkdir -p "$IPLIST_DIR"
+    if [ ! -s "$2" ]; then
+        printf '%b\n' "${RED}下载的文件为空，已丢弃: $1${RESET}" >&2
+        rm -f "$2"
+        return 1
     fi
-    
-    echo -e "${SUCCESS} 目录创建完成"
-}
-
-# 下载MaxMind GeoIP2数据库文件
-download_maxmind_mmdb() {
-    echo -e "${INFO} 正在下载MaxMind GeoIP2数据库..."
-    
-    local mmdb_url="https://github.com/Hackl0us/GeoIP2-CN/raw/release/Country.mmdb"
-    
-    echo -e "${INFO} 从 $mmdb_url 下载..."
-    
-    if curl -L -s "$mmdb_url" -o "$MMDB_FILE" 2>/dev/null && [ -s "$MMDB_FILE" ]; then
-        local file_size=$(du -h "$MMDB_FILE" | cut -f1)
-        echo -e "${SUCCESS} mmdb文件下载成功 (大小: $file_size)"
-        return 0
+    # bash 能解析 sh 写法；没有 bash 的系统（Alpine）用 sh 检查
+    if command -v bash >/dev/null 2>&1; then
+        _fv_shell=bash
     else
-        echo -e "${ERROR} 无法下载mmdb文件"
+        _fv_shell=sh
+    fi
+    if ! "$_fv_shell" -n "$2" 2>/dev/null; then
+        printf '%b\n' "${RED}下载的脚本未通过语法检查，已丢弃: $1${RESET}" >&2
+        rm -f "$2"
         return 1
+    fi
+    return 0
+}
+
+# ── lib/ss-ui.sh ──────────────────────────────────────────────────────────────
+# 菜单的样子（与 PSM、snell 的主菜单一致）：标题、「标签 ▶ 值」两列的状态栏、
+# ═ 框里两列的选项（先排满左列）、横线下的 0。bash。
+
+BOLD='\033[1m'
+BLUE='\033[34m'
+DIM='\033[2m'
+
+# 显示宽度，与 locale 无关（新装的 VPS 常常没有 UTF-8 locale）：逐个 UTF-8 字节看，
+# ASCII 与两字节的字符（×）占一格，三、四字节的（中文）占两格，后续字节不算
+ui_width() {
+    local s="$1" i code w=0
+    local LC_ALL=C
+    for (( i = 0; i < ${#s}; i++ )); do
+        printf -v code '%d' "'${s:i:1}"
+        (( code < 0 )) && (( code += 256 ))
+        if (( code < 0x80 || (code >= 0xC0 && code < 0xE0) )); then
+            w=$((w + 1))
+        elif (( code >= 0xE0 )); then
+            w=$((w + 2))
+        fi
+    done
+    echo "$w"
+}
+
+ui_pad() {   # <文字> <宽度>：文字后补空格到这个宽度
+    local w; w=$(ui_width "$1")
+    printf '%s%*s' "$1" $(( $2 > w ? $2 - w : 0 )) ''
+}
+
+# 状态栏：先 ui_status_reset，再逐项 ui_status_add <标签> <值> [颜色]，最后 ui_status_print
+UI_LABELS=(); UI_VALUES=(); UI_COLORS=()
+ui_status_reset() { UI_LABELS=(); UI_VALUES=(); UI_COLORS=(); }
+ui_status_add() { UI_LABELS+=("$1"); UI_VALUES+=("$2"); UI_COLORS+=("${3:-}"); }
+ui_status_print() {   # 标签 9 格，左列的值补到 16 格（长的值放右列）
+    local i line n=${#UI_LABELS[@]}
+    for (( i = 0; i < n; i += 2 )); do
+        line="  ${CYAN}$(ui_pad "${UI_LABELS[i]}" 9)${RESET} ▶  ${UI_COLORS[i]}"
+        if (( i + 1 < n )); then
+            line="${line}$(ui_pad "${UI_VALUES[i]}" 16)${RESET} ${CYAN}$(ui_pad "${UI_LABELS[i + 1]}" 9)${RESET} ▶  ${UI_COLORS[i + 1]}${UI_VALUES[i + 1]}${RESET}"
+        else
+            line="${line}${UI_VALUES[i]}${RESET}"
+        fi
+        echo -e "$line"
+    done
+}
+
+# 两列的选项：ui_items <标题> <左列行数> <第 1 项> <第 2 项> …（编号从 1 起，先排满左列）
+ui_items() {
+    local title="$1" rows="$2" i k w=0 line
+    shift 2
+    local items=("$@")
+    local wide="══════════════════════════════════════════════════════════════"
+    for (( i = 0; i < rows && i < ${#items[@]}; i++ )); do
+        k=$(ui_width "${items[i]}"); (( k > w )) && w=$k
+    done
+    echo -e "${BOLD}${BLUE}${wide}${RESET}"
+    # 标题居中（62 格）
+    k=$(ui_width "$title")
+    echo -e "${BOLD}$(printf '%*s' $(( (62 - k) / 2 )) '')${title}${RESET}"
+    echo -e "${BOLD}${BLUE}${wide}${RESET}"
+    for (( i = 0; i < rows && i < ${#items[@]}; i++ )); do
+        line="  ${CYAN}$(printf '%2d.' $((i + 1)))${RESET} "
+        if [ -n "${items[i + rows]:-}" ]; then
+            line="${line}$(ui_pad "${items[i]}" "$w")  ${CYAN}$(printf '%2d.' $((i + 1 + rows)))${RESET} ${items[i + rows]}"
+        else
+            line="${line}${items[i]}"
+        fi
+        echo -e "$line"
+    done
+}
+ui_items_end() {   # [0 的说明]
+    echo -e "${BOLD}${BLUE}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${CYAN} 0.${RESET} ${1:-退出}"
+    echo -e "${BOLD}${BLUE}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+# 子菜单：ui_sub <标题> <第 1 项> <第 2 项> …（一列，编号从 1 起，0 返回）
+ui_sub() {
+    local title="$1" i
+    shift
+    echo
+    echo -e "${BOLD}${BLUE}── ${title} $(printf '─%.0s' $(seq 1 $(( 40 - $(ui_width "$title") > 4 ? 40 - $(ui_width "$title") : 4 ))))${RESET}"
+    for (( i = 1; i <= $#; i++ )); do
+        echo -e "  ${CYAN}$(printf '%2d.' "$i")${RESET} ${!i}"
+    done
+    echo -e "  ${CYAN} 0.${RESET} 返回"
+}
+
+# 读一个选择；读不到（输入结束）时返回 1
+ui_read() {   # <变量名> [提示]
+    local __v
+    if ! read -rp "$(echo -e "${CYAN}${2:-请选择: }${RESET}")" __v; then
+        echo
+        return 1
+    fi
+    printf -v "$1" '%s' "$__v"
+}
+
+# 问 y/n：ui_yes <提示> [默认 y|n]
+ui_yes() {
+    local a d="${2:-n}" hint="[y/N]"
+    [ "$d" = y ] && hint="[Y/n]"
+    read -rp "$1 ${hint}: " a || return 1
+    a=${a:-$d}
+    case "$a" in [yY]*) return 0 ;; *) return 1 ;; esac
+}
+
+ui_pause() { echo; read -rp "$(echo -e "${CYAN}按回车返回…${RESET}")" _ || true; }
+
+ui_ok()   { echo -e "${GREEN}✓ $*${RESET}"; }
+ui_warn() { echo -e "${YELLOW}$*${RESET}"; }
+ui_err()  { echo -e "${RED}$*${RESET}"; }
+ui_info() { echo -e "${CYAN}$*${RESET}"; }
+
+# ── lib/ss-service.sh ─────────────────────────────────────────────────────────
+# ss-rust 的服务：systemd（Debian / Ubuntu / RHEL 系）或 OpenRC（Alpine）。
+# 主服务 ss-rust、每个额外端口一个 ss-rust-<端口>，名字与路径和旧版一样（PSM 也认这些）。
+# 主服务一般跑 /etc/ss-rust/config.json；开了单端口多用户时跑生成的 config-eih.json（见 ss-config.sh）。bash。
+
+ss_init() {
+    if [ -d /run/systemd/system ]; then
+        echo systemd
+    elif [ -x /sbin/openrc-run ] || command -v openrc-run >/dev/null 2>&1; then
+        echo openrc
+    else
+        echo none
     fi
 }
 
-# 从MaxMind mmdb文件提取中国IP CIDR
-extract_china_ip_from_mmdb() {
-    echo -e "${INFO} 正在从mmdb文件提取中国IP段..."
-    
-    if [ ! -f "$MMDB_FILE" ]; then
-        echo -e "${ERROR} mmdb文件不存在: $MMDB_FILE"
-        return 1
-    fi
-    
-    if [ ! -f "$EXTRACT_SCRIPT" ]; then
-        echo -e "${ERROR} 提取脚本不存在: $EXTRACT_SCRIPT"
-        return 1
-    fi
-    
-    # 先检查maxminddb库是否真的可用
-    if ! python3 -c "import maxminddb" 2>/dev/null; then
-        echo -e "${ERROR} maxminddb库不可用，跳过mmdb提取"
-        return 1
-    fi
-    
-    # 运行Python脚本提取CIDR
-    local output=$(PYTHONIOENCODING=UTF-8 LC_ALL=C.UTF-8 LANG=C.UTF-8 python3 "$EXTRACT_SCRIPT" "$MMDB_FILE" "$MAINLAND_IP_FILE" 2>&1)
-    
-    if [ -f "$MAINLAND_IP_FILE" ]; then
-        local ip_count=$(wc -l < "$MAINLAND_IP_FILE" 2>/dev/null || echo 0)
-        if [ "$ip_count" -gt 100 ]; then
-            echo -e "${SUCCESS} 已提取 $ip_count 个中国IP CIDR段"
-            return 0
-        fi
-    fi
-    
-    echo -e "${ERROR} IP段提取失败或数据不足"
-    echo -e "${INFO} 详细信息: $output"
+ss_unit_file() {   # <服务名>
+    case "$(ss_init)" in
+        openrc) echo "/etc/init.d/$1" ;;
+        *) echo "/etc/systemd/system/$1.service" ;;
+    esac
+}
+
+ss_svc_exists() { [ -f "$(ss_unit_file "$1")" ]; }
+
+# 写服务文件：<服务名> <配置文件> <说明>
+ss_write_service() {
+    local name="$1" conf="$2" desc="$3" f
+    f=$(ss_unit_file "$name")
+    case "$(ss_init)" in
+        systemd)
+            cat > "$f" <<EOF
+[Unit]
+Description=${desc}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${BINARY_PATH} -c ${conf}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            ;;
+        openrc)
+            cat > "$f" <<EOF
+#!/sbin/openrc-run
+description="${desc}"
+command="${BINARY_PATH}"
+command_args="-c ${conf}"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+rc_ulimit="-n 1048576"
+output_log="/var/log/${name}.log"
+error_log="/var/log/${name}.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+            chmod 755 "$f"
+            ;;
+        *)
+            ui_err "没有找到 systemd 或 OpenRC，无法创建服务。"
+            return 1
+            ;;
+    esac
+}
+
+# 服务文件里跑的是哪个配置
+ss_svc_conf() {   # <服务名>
+    sed -n 's/.*[ "]-c \([^ "]*\).*/\1/p' "$(ss_unit_file "$1")" 2>/dev/null | head -n 1
+}
+
+ss_svc_enable() {
+    case "$(ss_init)" in
+        systemd) systemctl enable "$1" >/dev/null 2>&1 ;;
+        openrc) rc-update add "$1" default >/dev/null 2>&1 ;;
+    esac
+}
+
+ss_svc() {   # <start|stop|restart> <服务名>
+    case "$(ss_init)" in
+        systemd) systemctl "$1" "$2" >/dev/null 2>&1 ;;
+        openrc) rc-service "$2" "$1" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+ss_svc_active() {   # <服务名>
+    case "$(ss_init)" in
+        systemd) systemctl is-active --quiet "$1" ;;
+        openrc) rc-service "$1" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+ss_svc_logs() {   # <服务名> [行数]
+    local n="${2:-20}"
+    case "$(ss_init)" in
+        systemd) journalctl --no-pager -n "$n" -u "$1" 2>/dev/null ;;
+        openrc) tail -n "$n" "/var/log/$1.log" 2>/dev/null ;;
+    esac
+}
+
+ss_svc_remove() {   # <服务名>
+    ss_svc stop "$1" || true
+    case "$(ss_init)" in
+        systemd)
+            systemctl disable "$1" >/dev/null 2>&1 || true
+            rm -f "/etc/systemd/system/$1.service"
+            systemctl daemon-reload
+            ;;
+        openrc)
+            rc-update del "$1" default >/dev/null 2>&1 || true
+            rm -f "/etc/init.d/$1" "/var/log/$1.log"
+            ;;
+    esac
+}
+
+# 启动（或重启）并确认在跑；起不来时打印日志与常见原因
+ss_svc_restart_verify() {   # <服务名>
+    local i
+    ss_svc restart "$1" || ss_svc start "$1" || true
+    for i in 1 2 3 4 5 6; do
+        sleep 1
+        ss_svc_active "$1" && return 0
+    done
+    ui_err "$1 没能运行起来，最近的日志："
+    ss_svc_logs "$1" 20 | sed 's/^/  /'
+    ui_warn "常见原因：密码与加密方式不匹配、端口被占用、混淆插件没装。"
     return 1
 }
 
-
-
-# 下载中国大陆IP列表（仅使用MaxMind）
-download_mainland_ip_list() {
-    echo -e "${INFO} 正在从MaxMind GeoIP2数据库提取中国IP列表..."
-    
-    # 下载并提取MaxMind mmdb文件
-    if download_maxmind_mmdb && extract_china_ip_from_mmdb; then
-        return 0
-    else
-        echo -e "${ERROR} 无法获取MaxMind数据，请检查网络连接或手动下载mmdb文件"
-        return 1
-    fi
-}
-
-# 检测SS-Rust端口（兼容空格、不同JSON结构）
-detect_ss_port() {
-    local default_port="8388"
-    local ss_port=""
-
-    if [ ! -f "$CONFIG_PATH" ]; then
-        echo "$default_port"
-        return 0
-    fi
-
-    # 优先用Python解析JSON，避免grep受格式影响
-    ss_port=$(python3 - "$CONFIG_PATH" << 'PY'
-import json
-import sys
-
-cfg_path = sys.argv[1]
-
-def print_port(value):
-    if isinstance(value, int) and 1 <= value <= 65535:
-        print(value)
-        return True
-    if isinstance(value, str) and value.isdigit():
-        num = int(value)
-        if 1 <= num <= 65535:
-            print(num)
-            return True
-    return False
-
-try:
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-except Exception:
-    print("")
-    raise SystemExit(0)
-
-# 常见单端口字段
-for key in ("server_port", "port", "local_port"):
-    if key in cfg and print_port(cfg[key]):
-        raise SystemExit(0)
-
-# 部分配置使用 servers 数组
-servers = cfg.get("servers")
-if isinstance(servers, list):
-    for item in servers:
-        if isinstance(item, dict) and "server_port" in item and print_port(item["server_port"]):
-            raise SystemExit(0)
-
-print("")
-PY
-)
-
-    # Python解析失败时，回退到grep（支持冒号两侧空格）
-    if [ -z "$ss_port" ]; then
-        ss_port=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' "$CONFIG_PATH" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)
-    fi
-
-    if [[ ! "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -lt 1 ] || [ "$ss_port" -gt 65535 ]; then
-        echo "$default_port"
-    else
-        echo "$ss_port"
-    fi
-}
-
-# 收集所有需要屏蔽的端口
-# 主节点端口之外，还必须覆盖 v3.3 引入的多端口节点，以及 ShadowTLS 的监听端口
-# （ShadowTLS 端口才是客户端实际连接的入口，漏掉等于屏蔽被完全绕过）
-collect_protected_ports() {
-    local ports=()
-    local p f svc
-
-    p=$(detect_ss_port)
-    [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
-
-    for f in /etc/ss-rust/ports/*.json; do
+# 本脚本管理的全部服务：主服务和每个额外端口的
+ss_all_services() {
+    local f
+    ss_svc_exists ss-rust && echo ss-rust
+    for f in "${PORTS_DIR}"/*.json; do
         [ -f "$f" ] || continue
-        p=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-        [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
-    done
-
-    for svc in /etc/systemd/system/shadowtls-*.service; do
-        [ -f "$svc" ] || continue
-        p=$(grep -oE -- '--listen [^ ]+' "$svc" 2>/dev/null | head -1 | sed 's/.*://')
-        [[ "$p" =~ ^[0-9]+$ ]] && ports+=("$p")
-    done
-
-    [ ${#ports[@]} -eq 0 ] && return 0
-    printf '%s\n' "${ports[@]}" | sort -un
-}
-
-# 删除所有引用 mainland_cn_src 的 INPUT 规则
-# 直接从 iptables-save 里解析，而不是按当前端口列表删——否则改过端口后旧规则会永远残留
-flush_mainland_rules() {
-    local rule guard=0
-    while [ $guard -lt 100 ]; do
-        rule=$(iptables-save 2>/dev/null | grep -m1 -- "-A INPUT .*--match-set mainland_cn_src src" || true)
-        [ -z "$rule" ] && break
-        # shellcheck disable=SC2086
-        iptables -D INPUT ${rule#-A INPUT } 2>/dev/null || break
-        guard=$((guard + 1))
+        echo "ss-rust-$(basename "$f" .json)"
     done
 }
 
-# 生成iptables规则
-generate_iptables_rules() {
-    echo -e "${INFO} 生成iptables规则..."
-    
-    if [ ! -f "$MAINLAND_IP_FILE" ]; then
-        echo -e "${ERROR} IP列表文件不存在"
-        return 1
-    fi
-    
-    local detected_ports
-    detected_ports=$(collect_protected_ports)
-    if [ -z "$detected_ports" ]; then
-        echo -e "${WARNING} 未检测到任何 SS / ShadowTLS 端口，将只使用默认端口"
-    else
-        echo -e "${INFO} 将屏蔽以下端口的大陆来源连接: $(echo "$detected_ports" | tr '\n' ' ')"
-    fi
+# ── lib/bm-rules.sh ───────────────────────────────────────────────────────────
+# 屏蔽中国大陆来源的连接：IP 库、规则脚本、状态。
+#
+# IP 库是纯文本的 CIDR 列表：IPv4 来自 Hackl0us/GeoIP2-CN（与旧版用的 Country.mmdb 同一份数据，
+# 不再需要 Python 与 maxminddb），IPv6 来自 gaoyifan/china-operator-ip。
+# 规则脚本 /etc/ss-rust/mainland_cn_rules.sh 自成一体（POSIX sh）：每次运行时现找要保护的端口
+# （主端口、额外端口、ShadowTLS 的监听端口），用 ipset restore 一次导入，再给每个端口下 DROP。
+# 开机由 block-mainland 服务运行它（ipset 是内存里的，重启就没了）。bash。
 
-    # 规则脚本在**运行时**自行探测端口，这样新增多端口节点或 ShadowTLS 之后，
-    # 开机自动恢复也能覆盖到，无需重新生成
-    cat > "$IPTABLES_RULES" << 'RULESEOF'
-#!/bin/bash
-# 中国大陆IP屏蔽规则
-# 自动生成，请勿手动修改
+BM_DIR="/etc/ss-rust/iprules"
+BM_V4_FILE="${BM_DIR}/mainland_cn.txt"
+BM_V6_FILE="${BM_DIR}/mainland_cn6.txt"
+BM_RULES="/etc/ss-rust/mainland_cn_rules.sh"
+BM_V4_URL="${BM_V4_URL:-https://raw.githubusercontent.com/Hackl0us/GeoIP2-CN/release/CN-ip-cidr.txt}"
+BM_V6_URL="${BM_V6_URL:-https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china6.txt}"
 
-set -u
-
-# 运行时探测所有需要保护的端口：主节点 + 多端口节点 + ShadowTLS 入口
-collect_ports() {
-    local ports=() p f svc
-
-    if [ -f /etc/ss-rust/config.json ]; then
-        p=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' /etc/ss-rust/config.json 2>/dev/null | grep -oE '[0-9]+' | head -1)
-        [ -n "${p:-}" ] && ports+=("$p")
-    fi
-
-    for f in /etc/ss-rust/ports/*.json; do
-        [ -f "$f" ] || continue
-        p=$(grep -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -1)
-        [ -n "${p:-}" ] && ports+=("$p")
-    done
-
-    for svc in /etc/systemd/system/shadowtls-*.service; do
-        [ -f "$svc" ] || continue
-        p=$(grep -oE -- '--listen [^ ]+' "$svc" 2>/dev/null | head -1 | sed 's/.*://')
-        case "${p:-}" in
-            ''|*[!0-9]*) ;;
-            *) ports+=("$p") ;;
-        esac
-    done
-
-    [ ${#ports[@]} -eq 0 ] && ports=("8388")
-    printf '%s\n' "${ports[@]}" | sort -un
+bm_deps() {
+    detect_os
+    ensure_cmds curl ipset iptables || { ui_err "依赖安装失败（ipset、iptables）。"; return 1; }
+    command -v ip6tables >/dev/null 2>&1 || pkg_install ip6tables >/dev/null 2>&1 || true
+    return 0
 }
 
-echo "[信息] 清除旧的屏蔽规则..."
-# 按 iptables-save 解析删除，确保改过端口后的旧规则也能清干净
-guard=0
-while [ $guard -lt 100 ]; do
-    rule=$(iptables-save 2>/dev/null | grep -m1 -- "-A INPUT .*--match-set mainland_cn_src src" || true)
-    [ -z "$rule" ] && break
-    iptables -D INPUT ${rule#-A INPUT } 2>/dev/null || break
-    guard=$((guard + 1))
-done
-ipset destroy mainland_cn_src 2>/dev/null || true
-
-echo "[信息] 创建ipset集合..."
-ipset create mainland_cn_src hash:net maxelem 200000
-
-echo "[信息] 导入IP列表..."
-/usr/local/bin/block-mainland-import-ips.sh
-
-echo "[信息] 应用iptables规则..."
-for port in $(collect_ports); do
-    echo "[信息]   屏蔽端口 ${port}"
-    iptables -I INPUT -p tcp --dport "$port" -m set --match-set mainland_cn_src src -j DROP
-    iptables -I INPUT -p udp --dport "$port" -m set --match-set mainland_cn_src src -j DROP
-done
-
-echo "[成功] 规则应用完成"
-RULESEOF
-    
-    chmod +x "$IPTABLES_RULES"
-    echo -e "${SUCCESS} iptables规则生成完成"
-}
-
-# 生成IP导入脚本
-generate_import_script() {
-    echo -e "${INFO} 生成IP导入脚本..."
-    
-    local import_script="/usr/local/bin/block-mainland-import-ips.sh"
-    
-    cat > "$import_script" << 'IMPORTEOF'
-#!/bin/bash
-# IP导入脚本 - 支持CIDR和纯IP格式
-
-MAINLAND_IP_FILE="__MAINLAND_IP_FILE__"
-
-echo "[信息] 开始导入IP列表..."
-
-local_count=0
-local_total=$(wc -l < "$MAINLAND_IP_FILE" 2>/dev/null || echo 0)
-
-while IFS= read -r line; do
-    # 跳过空行和注释
-    [ -z "$line" ] && continue
-    [[ "$line" =~ ^# ]] && continue
-    
-    # 清理空白
-    line=$(echo "$line" | xargs)
-    
-    # 检查是否包含前缀长度标记(/)
-    if [[ ! "$line" =~ / ]]; then
-        # 纯IP地址，转换为/32
-        line="${line}/32"
-    fi
-    
-    # 导入到ipset
-    if ipset add mainland_cn_src "$line" 2>/dev/null; then
-        ((local_count++))
-    fi
-    
-    # 进度显示
-    if [ $((local_count % 1000)) -eq 0 ]; then
-        echo "[进度] 已导入 $local_count/$local_total ..."
-    fi
-done < "$MAINLAND_IP_FILE"
-
-if [ "$local_count" -eq 0 ]; then
-    echo "[错误] 未导入任何IP段，请检查IP列表内容或格式"
-    exit 1
-fi
-
-echo "[成功] IP列表导入完成！共导入 $local_count 条IP段"
-IMPORTEOF
-
-    sed -i "s|__MAINLAND_IP_FILE__|$MAINLAND_IP_FILE|g" "$import_script"
-    
-    chmod +x "$import_script"
-    echo -e "${SUCCESS} IP导入脚本生成完成"
-}
-
-# 安装ipset
-install_ipset() {
-    echo -e "${INFO} 检查ipset..."
-    
-    if ! command -v ipset &> /dev/null; then
-        echo -e "${WARNING} ipset未安装，正在安装..."
-        
-        if command -v apt-get &> /dev/null; then
-            apt-get install -y ipset
-        elif command -v yum &> /dev/null; then
-            yum install -y ipset
+# 下载一个列表：只留像 CIDR 的行，太少就当没下到（不覆盖已有的）
+bm_fetch_list() {   # <地址> <文件> <至少几行>
+    local tmp n
+    tmp=$(mktemp) || return 1
+    if curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 "$1" 2>/dev/null \
+        | grep -E '^[0-9a-fA-F:.]+/[0-9]+$' > "$tmp"; then
+        n=$(wc -l < "$tmp" | tr -d ' ')
+        if [ "$n" -ge "$3" ]; then
+            mkdir -p "$BM_DIR"; mv -f "$tmp" "$2"; echo "$n"; return 0
         fi
     fi
-    
-    echo -e "${SUCCESS} ipset检查完成"
+    rm -f "$tmp"
+    return 1
 }
 
-# 安装开机自动恢复服务
-# ipset 集合是内核内存态，重启后必然消失；只保存 iptables 规则不但无效，
-# 还会因为规则引用了不存在的 set 导致 iptables-restore 整体失败。
-# 因此改为开机重跑一次规则脚本（会重建 ipset 并重新下规则）。
-install_boot_service() {
-    echo -e "${INFO} 配置开机自动恢复..."
+bm_download() {
+    local n
+    ui_info "下载中国大陆的 IP 段…"
+    if n=$(bm_fetch_list "$BM_V4_URL" "$BM_V4_FILE" 1000); then
+        ui_ok "IPv4：${n} 段"
+    elif [ -s "$BM_V4_FILE" ]; then
+        ui_warn "IPv4 列表下载失败，用已有的（$(wc -l < "$BM_V4_FILE" | tr -d ' ') 段）"
+    else
+        ui_err "IPv4 列表下载失败：$BM_V4_URL"; return 1
+    fi
+    if n=$(bm_fetch_list "$BM_V6_URL" "$BM_V6_FILE" 100); then
+        ui_ok "IPv6：${n} 段"
+    else
+        ui_warn "IPv6 列表下载失败$( [ -s "$BM_V6_FILE" ] && echo "，用已有的" || echo "，这次只屏蔽 IPv4")"
+    fi
+    return 0
+}
 
-    cat > "$BOOT_SERVICE_FILE" << EOF
+# 写规则脚本。它不依赖本脚本：开机、改端口后直接运行它即可（参数 stop 是撤掉规则）
+bm_write_rules() {
+    mkdir -p "$(dirname "$BM_RULES")"
+    cat > "$BM_RULES" <<'EOF'
+#!/bin/sh
+# 由 block-mainland.sh 生成：屏蔽中国大陆来源到 Shadowsocks / ShadowTLS 端口的连接。
+# 运行它 = 按现在的端口重新下规则；加参数 stop = 撤掉规则。请勿手改（重新启用时会覆盖）。
+DIR=/etc/ss-rust/iprules
+
+# 现在要保护的端口：主端口、额外端口、ShadowTLS 的监听端口
+ports() {
+    for f in /etc/ss-rust/config.json /etc/ss-rust/ports/*.json; do
+        [ -f "$f" ] || continue
+        sed -n 's/.*"server_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" | head -n 1
+    done
+    for f in /etc/systemd/system/shadowtls-*.service; do
+        [ -f "$f" ] || continue
+        sed -n 's/.*--listen [^ ]*:\([0-9][0-9]*\).*/\1/p' "$f" | head -n 1
+    done
+}
+
+# 删掉引用某个集合的全部 INPUT 规则（按 *-save 的输出删，改过端口的旧规则也删得掉）
+flush() {   # <iptables|ip6tables> <集合>
+    command -v "$1" >/dev/null 2>&1 || return 0
+    i=0
+    while [ $i -lt 200 ]; do
+        r=$("$1-save" 2>/dev/null | grep -m1 -- "-A INPUT .*--match-set $2 src") || break
+        [ -n "$r" ] || break
+        # shellcheck disable=SC2086
+        "$1" -D INPUT ${r#-A INPUT } 2>/dev/null || break
+        i=$((i + 1))
+    done
+}
+
+apply() {   # <iptables|ip6tables> <集合> <inet|inet6> <列表文件>
+    flush "$1" "$2"
+    ipset destroy "$2" 2>/dev/null
+    [ "${STOP:-}" = 1 ] && return 0
+    [ -s "$4" ] && command -v "$1" >/dev/null 2>&1 || return 0
+    { echo "create $2 hash:net family $3 maxelem 262144"; sed "s/^/add $2 /" "$4"; } | ipset restore -exist || return 1
+    for p in $(ports | sort -un); do
+        "$1" -I INPUT -p tcp --dport "$p" -m set --match-set "$2" src -j DROP
+        "$1" -I INPUT -p udp --dport "$p" -m set --match-set "$2" src -j DROP
+    done
+}
+
+[ "${1:-}" = stop ] && STOP=1
+apply iptables mainland_cn_src inet "$DIR/mainland_cn.txt" || exit 1
+apply ip6tables mainland_cn6_src inet6 "$DIR/mainland_cn6.txt" || true
+EOF
+    chmod 755 "$BM_RULES"
+    # 旧版的逐行导入脚本用不到了
+    rm -f /usr/local/bin/block-mainland-import-ips.sh
+}
+
+bm_active() { iptables-save 2>/dev/null | grep -q 'mainland_cn_src'; }
+
+# 与规则脚本里一样的端口
+bm_ports() {
+    local f
+    for f in "$CONFIG_PATH" /etc/ss-rust/ports/*.json; do
+        [ -f "$f" ] || continue
+        sed -n 's/.*"server_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" | head -n 1
+    done
+    for f in /etc/systemd/system/shadowtls-*.service; do
+        [ -f "$f" ] || continue
+        sed -n 's/.*--listen [^ ]*:\([0-9][0-9]*\).*/\1/p' "$f" | head -n 1
+    done | sort -un
+}
+
+bm_status() {
+    local v4p v6p missing="" p
+    echo
+    echo -e "${BOLD}${BLUE}── 中国大陆屏蔽 ──────────────────────────────${RESET}"
+    echo -e "  要保护的端口  $(bm_ports | tr '\n' ' ')"
+    echo -e "  IP 库         IPv4 $( [ -s "$BM_V4_FILE" ] && wc -l < "$BM_V4_FILE" | tr -d ' ' || echo 0) 段，IPv6 $( [ -s "$BM_V6_FILE" ] && wc -l < "$BM_V6_FILE" | tr -d ' ' || echo 0) 段"
+    v4p=$(iptables -S INPUT 2>/dev/null | grep -- '--match-set mainland_cn_src src' | sed -n 's/.*--dport \([0-9]*\).*/\1/p' | sort -un | tr '\n' ' ')
+    v6p=$(ip6tables -S INPUT 2>/dev/null | grep -- '--match-set mainland_cn6_src src' | sed -n 's/.*--dport \([0-9]*\).*/\1/p' | sort -un | tr '\n' ' ')
+    if [ -n "$v4p" ]; then
+        echo -e "  规则          ${GREEN}已启用${RESET}  IPv4：${v4p}$( [ -n "$v6p" ] && echo " IPv6：${v6p}")"
+        for p in $(bm_ports); do case " $v4p " in *" $p "*) ;; *) missing="${missing}${p} " ;; esac; done
+        [ -n "$missing" ] && ui_warn "  这些端口还没屏蔽：${missing}（重新选「启用」即可）"
+    else
+        echo -e "  规则          ${YELLOW}未启用${RESET}"
+    fi
+    echo -e "  开机自动恢复  $(bm_boot_enabled && echo "${GREEN}已启用${RESET}" || echo "${YELLOW}未启用${RESET}")"
+    echo -e "  定时更新      $(bm_auto_update_state)"
+}
+
+# ── lib/bm-boot.sh ────────────────────────────────────────────────────────────
+# 开机自动恢复（systemd 服务 / OpenRC 服务）与定时更新 IP 库（systemd 定时器 /
+# Alpine 的 /etc/periodic）。不依赖 cron 软件包。bash。
+
+BM_BOOT_UNIT="/etc/systemd/system/block-mainland.service"
+BM_BOOT_OPENRC="/etc/init.d/block-mainland"
+BM_TIMER="/etc/systemd/system/block-mainland-update.timer"
+BM_TIMER_SVC="/etc/systemd/system/block-mainland-update.service"
+BM_PERIODIC_NAME="block-mainland-update"
+BM_UPDATE_LOG="/var/log/block-mainland-update.log"
+BM_SELF="/usr/local/bin/block-mainland.sh"
+BM_OLD_CRON="/etc/cron.d/block-mainland-auto-update"   # 旧版的定时任务
+
+bm_boot_enable() {
+    case "$(ss_init)" in
+        systemd)
+            cat > "$BM_BOOT_UNIT" <<EOF
 [Unit]
-Description=Block mainland China IPs for Shadowsocks
+Description=Block mainland China connections to Shadowsocks
 After=network-online.target ss-rust.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash ${IPTABLES_RULES}
-StandardOutput=journal
-StandardError=journal
+ExecStart=/bin/sh ${BM_RULES}
+ExecStop=/bin/sh ${BM_RULES} stop
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    if systemctl enable "$BOOT_SERVICE_NAME" >/dev/null 2>&1; then
-        echo -e "${SUCCESS} 已启用开机自动恢复（${BOOT_SERVICE_NAME}）"
-    else
-        echo -e "${WARNING} 开机自动恢复服务启用失败，重启后需手动执行: bash $IPTABLES_RULES"
-    fi
-}
-
-# 移除开机自动恢复服务
-remove_boot_service() {
-    if [ -f "$BOOT_SERVICE_FILE" ]; then
-        systemctl disable "$BOOT_SERVICE_NAME" >/dev/null 2>&1 || true
-        rm -f "$BOOT_SERVICE_FILE"
-        systemctl daemon-reload
-    fi
-}
-
-# 启用屏蔽规则
-enable_blocking() {
-    echo -e "${INFO} 启用屏蔽规则..."
-    
-    # 安装ipset
-    install_ipset
-    
-    # 生成并执行规则
-    if [ ! -f "$IPTABLES_RULES" ]; then
-        echo -e "${ERROR} 规则文件不存在: $IPTABLES_RULES"
-        return 1
-    fi
-    if ! bash "$IPTABLES_RULES"; then
-        echo -e "${ERROR} 规则应用失败"
-        return 1
-    fi
-    
-    # 保存iptables规则（部分系统装了 netfilter-persistent 会用到；目录可能不存在）
-    if command -v iptables-save &> /dev/null; then
-        mkdir -p /etc/iptables 2>/dev/null || true
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
-
-    # 关键：重启后 ipset 会清空，必须靠开机服务重建
-    install_boot_service
-    
-    echo -e "${SUCCESS} 屏蔽规则已启用"
-}
-
-# 禁用屏蔽规则
-disable_blocking() {
-    echo -e "${INFO} 禁用屏蔽规则..."
-
-    # 删除所有引用 mainland_cn_src 的规则（不依赖当前端口，改过端口的旧规则也能清掉）
-    flush_mainland_rules
-    
-    # 删除ipset
-    ipset destroy mainland_cn_src 2>/dev/null || true
-
-    # 取消开机自动恢复，否则重启后又会被重新下上
-    remove_boot_service
-
-    # 同步已保存的规则，避免 netfilter-persistent 在重启时恢复旧规则
-    if command -v iptables-save &> /dev/null && [ -f /etc/iptables/rules.v4 ]; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
-    
-    echo -e "${SUCCESS} 屏蔽规则已禁用"
-}
-
-# 查看规则状态
-show_status() {
-    local protected_ports
-    protected_ports=$(collect_protected_ports | tr '\n' ' ')
-
-    echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
-    echo -e "${BLUE}${BOLD}    中国大陆屏蔽规则状态${PLAIN}"
-    echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
-    echo -e "${BOLD}受保护端口:${PLAIN} ${protected_ports:-无}"
-    
-    echo ""
-    echo -e "${BOLD}IP列表文件:${PLAIN}"
-    if [ -f "$MAINLAND_IP_FILE" ]; then
-        local ip_count=$(wc -l < "$MAINLAND_IP_FILE")
-        echo -e "  ${GREEN}✓${PLAIN} 存在 (共 $ip_count 个CIDR段)"
-        echo -e "  文件路径: $MAINLAND_IP_FILE"
-        echo -e "  文件大小: $(du -h "$MAINLAND_IP_FILE" | cut -f1)"
-    else
-        echo -e "  ${RED}✗${PLAIN} 不存在"
-    fi
-    
-    echo ""
-    echo -e "${BOLD}ipset状态:${PLAIN}"
-    if ipset list mainland_cn_src &>/dev/null; then
-        local ip_set_count=$(ipset save mainland_cn_src | grep "add" | wc -l)
-        echo -e "  ${GREEN}✓${PLAIN} 已创建 (共 $ip_set_count 个IP段)"
-    else
-        echo -e "  ${RED}✗${PLAIN} 未创建"
-    fi
-    
-    echo ""
-    echo -e "${BOLD}iptables规则:${PLAIN}"
-    local rule_ports
-    rule_ports=$(iptables -S INPUT 2>/dev/null | grep -- "--match-set mainland_cn_src src" | grep -oE '\-\-dport [0-9]+' | awk '{print $2}' | sort -un | tr '\n' ' ')
-    if [ -n "$rule_ports" ]; then
-        echo -e "  ${GREEN}✓${PLAIN} 已启用 (生效端口: ${rule_ports})"
-        # 有节点端口没被覆盖时明确提示，否则用户会以为已经全屏蔽了
-        local missing="" pt
-        for pt in $(collect_protected_ports); do
-            case " $rule_ports " in
-                *" $pt "*) ;;
-                *) missing="${missing}${pt} " ;;
-            esac
-        done
-        if [ -n "$missing" ]; then
-            echo -e "  ${YELLOW}!${PLAIN} 以下端口尚未纳入屏蔽: ${missing}"
-            echo -e "  ${YELLOW}!${PLAIN} 请重新执行\"初始化并启用屏蔽\"以覆盖新增节点"
-        fi
-    elif iptables -S INPUT 2>/dev/null | grep -q "mainland_cn_src"; then
-        echo -e "  ${GREEN}✓${PLAIN} 已启用"
-    else
-        echo -e "  ${RED}✗${PLAIN} 未启用"
-    fi
-
-    echo ""
-    echo -e "${BOLD}开机自动恢复:${PLAIN}"
-    if [ -f "$BOOT_SERVICE_FILE" ] && systemctl is-enabled "$BOOT_SERVICE_NAME" >/dev/null 2>&1; then
-        echo -e "  ${GREEN}✓${PLAIN} 已启用 (${BOOT_SERVICE_NAME})"
-    else
-        echo -e "  ${RED}✗${PLAIN} 未启用 — 服务器重启后屏蔽规则将失效"
-    fi
-    
-    echo ""
-    echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
-}
-
-# 更新IP列表
-update_ip_list() {
-    echo -e "${INFO} 更新IP列表..."
-    
-    # 禁用旧规则
-    disable_blocking
-    
-    # 下载新列表
-    download_mainland_ip_list || {
-        echo -e "${ERROR} IP列表更新失败"
-        return 1
-    }
-    
-    # 重新生成规则和脚本
-    generate_iptables_rules
-    generate_import_script
-    
-    # 启用新规则
-    enable_blocking
-    
-    echo -e "${SUCCESS} IP列表更新完成"
-}
-
-# 获取用于定时任务调用的脚本路径
-get_script_exec_path() {
-    if [ -x "/usr/local/bin/block-mainland.sh" ]; then
-        echo "/usr/local/bin/block-mainland.sh"
-    else
-        echo "$SCRIPT_FULL_PATH"
-    fi
-}
-
-# 校验cron表达式（仅校验字段数）
-is_valid_cron_expr() {
-    local expr="$1"
-    expr=$(echo "$expr" | awk '{$1=$1; print}')
-
-    if [ -z "$expr" ]; then
-        return 1
-    fi
-
-    [ "$(echo "$expr" | awk '{print NF}')" -eq 5 ]
-}
-
-# 规范化输入的计划类型
-normalize_schedule_input() {
-    local input="$1"
-
-    case "$input" in
-        daily)
-            echo "$DAILY_CRON_EXPR"
+            systemctl daemon-reload
+            systemctl enable block-mainland >/dev/null 2>&1
             ;;
-        weekly)
-            echo "$WEEKLY_CRON_EXPR"
+        openrc)
+            cat > "$BM_BOOT_OPENRC" <<EOF
+#!/sbin/openrc-run
+description="Block mainland China connections to Shadowsocks"
+
+depend() {
+    need net
+    after firewall iptables ip6tables ss-rust
+}
+
+start() {
+    ebegin "Applying mainland China block rules"
+    /bin/sh ${BM_RULES} >/dev/null 2>&1
+    eend \$?
+}
+
+stop() {
+    ebegin "Removing mainland China block rules"
+    /bin/sh ${BM_RULES} stop >/dev/null 2>&1
+    eend 0
+}
+EOF
+            chmod 755 "$BM_BOOT_OPENRC"
+            rc-update add block-mainland default >/dev/null 2>&1
+            # 让 OpenRC 记下它已启动（规则刚才已经下了，start 再跑一次也无妨）
+            rc-service block-mainland start >/dev/null 2>&1 || true
             ;;
-        *)
-            echo "$input"
-            ;;
+        *) ui_warn "没有 systemd 或 OpenRC：重启后要手动运行 sh ${BM_RULES}"; return 1 ;;
     esac
 }
 
-# 尝试确保系统的cron服务可用
-ensure_cron_service() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        return 0
+bm_boot_disable() {
+    if [ -f "$BM_BOOT_UNIT" ]; then
+        systemctl disable block-mainland >/dev/null 2>&1 || true
+        rm -f "$BM_BOOT_UNIT"; systemctl daemon-reload
     fi
-
-    if systemctl list-unit-files 2>/dev/null | grep -q '^cron.service'; then
-        systemctl enable --now cron >/dev/null 2>&1 || true
-    elif systemctl list-unit-files 2>/dev/null | grep -q '^crond.service'; then
-        systemctl enable --now crond >/dev/null 2>&1 || true
+    if [ -f "$BM_BOOT_OPENRC" ]; then
+        rc-update del block-mainland default >/dev/null 2>&1 || true
+        rm -f "$BM_BOOT_OPENRC"
     fi
+    return 0
 }
 
-# 开启定时更新
-enable_auto_update() {
-    local schedule_input="$1"
-    local cron_expr=""
+bm_boot_enabled() {
+    case "$(ss_init)" in
+        systemd) [ -f "$BM_BOOT_UNIT" ] && systemctl is-enabled --quiet block-mainland 2>/dev/null ;;
+        openrc) [ -f "$BM_BOOT_OPENRC" ] && rc-update show default 2>/dev/null | grep -qw block-mainland ;;
+        *) return 1 ;;
+    esac
+}
 
-    if [ -n "$schedule_input" ]; then
-        cron_expr=$(normalize_schedule_input "$schedule_input")
-        if ! is_valid_cron_expr "$cron_expr"; then
-            echo -e "${ERROR} 无效的cron表达式: $schedule_input"
-            echo -e "${INFO} 示例: '30 4 * * *'"
-            return 1
-        fi
-    else
-        echo -e "${INFO} 请选择定时更新频率:"
-        echo "  1) 每日 04:30"
-        echo "  2) 每周一 04:30"
-        echo "  3) 自定义 cron 表达式"
-        read -p "请选择 [1-3] (默认: 1): " schedule_choice
-        [ -z "$schedule_choice" ] && schedule_choice="1"
+# 定时更新：每天或每周一 04:30 运行一次 block-mainland.sh update
+bm_auto_update_enable() {   # <daily|weekly>
+    local when="${1:-daily}" cal
+    case "$when" in
+        daily) cal="*-*-* 04:30:00" ;;
+        weekly) cal="Mon *-*-* 04:30:00" ;;
+        *) ui_err "只支持 daily 或 weekly"; return 1 ;;
+    esac
+    [ -x "$BM_SELF" ] || { ui_err "没有 ${BM_SELF}（定时任务要运行它）"; return 1; }
+    rm -f "$BM_OLD_CRON"
+    case "$(ss_init)" in
+        systemd)
+            cat > "$BM_TIMER_SVC" <<EOF
+[Unit]
+Description=Update the mainland China IP lists for block-mainland
 
-        case "$schedule_choice" in
-            1)
-                cron_expr="$DAILY_CRON_EXPR"
-                ;;
-            2)
-                cron_expr="$WEEKLY_CRON_EXPR"
-                ;;
-            3)
-                read -p "请输入 cron 表达式(5段，如: 30 4 * * *): " custom_expr
-                if ! is_valid_cron_expr "$custom_expr"; then
-                    echo -e "${ERROR} cron表达式格式无效"
-                    return 1
-                fi
-                cron_expr="$custom_expr"
-                ;;
-            *)
-                echo -e "${ERROR} 无效选项"
-                return 1
-                ;;
-        esac
-    fi
-
-    ensure_cron_service
-
-    local script_exec_path
-    script_exec_path=$(get_script_exec_path)
-
-    touch "$AUTO_UPDATE_LOG_FILE"
-
-    cat > "$AUTO_UPDATE_CRON_FILE" << EOF
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-$cron_expr root PYTHONIOENCODING=UTF-8 LC_ALL=C.UTF-8 LANG=C.UTF-8 bash $script_exec_path update >> $AUTO_UPDATE_LOG_FILE 2>&1
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'bash ${BM_SELF} update >> ${BM_UPDATE_LOG} 2>&1'
 EOF
+            cat > "$BM_TIMER" <<EOF
+[Unit]
+Description=Update the mainland China IP lists (${when})
 
-    chmod 644 "$AUTO_UPDATE_CRON_FILE"
+[Timer]
+OnCalendar=${cal}
+RandomizedDelaySec=10min
+Persistent=true
 
-    echo -e "${SUCCESS} 定时更新已开启"
-    echo -e "${INFO} 更新频率: $cron_expr"
-    echo -e "${INFO} 日志文件: $AUTO_UPDATE_LOG_FILE"
+[Install]
+WantedBy=timers.target
+EOF
+            systemctl daemon-reload
+            systemctl enable --now block-mainland-update.timer >/dev/null 2>&1
+            ;;
+        openrc)
+            rm -f "/etc/periodic/daily/$BM_PERIODIC_NAME" "/etc/periodic/weekly/$BM_PERIODIC_NAME"
+            mkdir -p "/etc/periodic/$when"
+            printf '#!/bin/sh\nbash %s update >> %s 2>&1\n' "$BM_SELF" "$BM_UPDATE_LOG" > "/etc/periodic/$when/$BM_PERIODIC_NAME"
+            chmod 755 "/etc/periodic/$when/$BM_PERIODIC_NAME"
+            # Alpine 的 crond 跑 /etc/periodic，确认它开着
+            rc-update add crond default >/dev/null 2>&1 || true
+            rc-service crond start >/dev/null 2>&1 || true
+            ;;
+        *) ui_err "没有 systemd 或 OpenRC，无法定时。"; return 1 ;;
+    esac
+    ui_ok "已开启定时更新（$( [ "$when" = daily ] && echo 每天 || echo 每周一 ) 04:30），日志：${BM_UPDATE_LOG}"
 }
 
-# 关闭定时更新
-disable_auto_update() {
-    if [ -f "$AUTO_UPDATE_CRON_FILE" ]; then
-        rm -f "$AUTO_UPDATE_CRON_FILE"
-        echo -e "${SUCCESS} 定时更新已关闭"
+bm_auto_update_disable() {
+    if [ -f "$BM_TIMER" ]; then
+        systemctl disable --now block-mainland-update.timer >/dev/null 2>&1 || true
+        rm -f "$BM_TIMER" "$BM_TIMER_SVC"; systemctl daemon-reload
+    fi
+    rm -f "/etc/periodic/daily/$BM_PERIODIC_NAME" "/etc/periodic/weekly/$BM_PERIODIC_NAME" "$BM_OLD_CRON"
+    ui_ok "已关闭定时更新"
+}
+
+bm_auto_update_state() {
+    if [ -f "$BM_TIMER" ]; then
+        if grep -q '^OnCalendar=Mon' "$BM_TIMER"; then echo "每周一 04:30（systemd 定时器）"; else echo "每天 04:30（systemd 定时器）"; fi
+    elif [ -f "/etc/periodic/daily/$BM_PERIODIC_NAME" ]; then echo "每天（/etc/periodic/daily）"
+    elif [ -f "/etc/periodic/weekly/$BM_PERIODIC_NAME" ]; then echo "每周（/etc/periodic/weekly）"
+    elif [ -f "$BM_OLD_CRON" ]; then echo "旧版的 cron 任务（重新开启会换成定时器）"
+    else echo "未开启"; fi
+}
+
+
+# 定时更新要运行本脚本：在用的是文件就用它，否则（bash <(curl …) 时）放一份到 /usr/local/bin
+bm_self() {
+    if [ -f "$0" ] && head -n 5 "$0" | grep -q 'block-mainland'; then
+        BM_SELF=$(readlink -f "$0")
+    elif [ ! -x "$BM_SELF" ]; then
+        fetch_verified_script "${SS_RAW_BASE}/block-mainland.sh" "$BM_SELF" >/dev/null 2>&1 && chmod 755 "$BM_SELF"
+    fi
+}
+
+# 旧版把含 ipset 引用的规则存进了 /etc/iptables/rules.v4：开机时集合还不存在，
+# netfilter-persistent 整个恢复都会失败。只删掉这些行，文件里别的规则不动。
+bm_clean_saved_rules() {
+    local f
+    for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+        [ -f "$f" ] && grep -q 'mainland_cn' "$f" && sed -i '/mainland_cn/d' "$f"
+    done
+    return 0
+}
+
+bm_enable() {
+    bm_deps || return 1
+    bm_download || return 1
+    bm_write_rules
+    if ! sh "$BM_RULES"; then
+        ui_err "规则没下成功（容器里需要 NET_ADMIN 权限，内核要有 ip_set 模块）。"
+        return 1
+    fi
+    bm_clean_saved_rules
+    bm_boot_enable
+    ui_ok "已屏蔽中国大陆来源的连接（端口：$(bm_ports | tr '\n' ' ')），开机自动恢复"
+}
+
+bm_disable() {
+    if [ -f "$BM_RULES" ]; then
+        sh "$BM_RULES" stop
     else
-        echo -e "${WARNING} 定时更新未启用"
+        # 没有规则脚本（旧版或手动删了）：直接删
+        local r i=0
+        while [ $i -lt 200 ] && r=$(iptables-save 2>/dev/null | grep -m1 -- "-A INPUT .*--match-set mainland_cn_src src") && [ -n "$r" ]; do
+            # shellcheck disable=SC2086
+            iptables -D INPUT ${r#-A INPUT } 2>/dev/null || break; i=$((i + 1))
+        done
+        ipset destroy mainland_cn_src 2>/dev/null
     fi
+    bm_boot_disable
+    bm_clean_saved_rules
+    ui_ok "已停用屏蔽（开机也不再恢复）"
 }
 
-# 查看定时更新状态
-show_auto_update_status() {
-    echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
-    echo -e "${BLUE}${BOLD}      定时更新任务状态${PLAIN}"
-    echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
-
-    if [ -f "$AUTO_UPDATE_CRON_FILE" ]; then
-        local cron_line
-        cron_line=$(grep -vE '^(#|SHELL=|PATH=|$)' "$AUTO_UPDATE_CRON_FILE" | head -1)
-        local cron_expr
-        cron_expr=$(echo "$cron_line" | awk '{print $1" "$2" "$3" "$4" "$5}')
-
-        echo -e "${GREEN}✓${PLAIN} 已启用"
-        echo -e "  调度表达式: $cron_expr"
-        echo -e "  任务文件: $AUTO_UPDATE_CRON_FILE"
+# 更新 IP 库：屏蔽开着就按新库重下规则；没开就只更新文件（不会替你开）
+bm_update() {
+    bm_deps || return 1
+    bm_download || return 1
+    if bm_active; then
+        bm_write_rules
+        sh "$BM_RULES" && ui_ok "已按新的 IP 库重下规则"
     else
-        echo -e "${RED}✗${PLAIN} 未启用"
+        ui_info "屏蔽没有开，只更新了 IP 库。"
     fi
-
-    if [ -f "$AUTO_UPDATE_LOG_FILE" ]; then
-        echo -e "  日志文件: $AUTO_UPDATE_LOG_FILE"
-        echo -e "  日志大小: $(du -h "$AUTO_UPDATE_LOG_FILE" | cut -f1)"
-    fi
-
-    echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
 }
 
-# 显示菜单
-show_menu() {
-    echo ""
-    echo -e "${BLUE}${BOLD}════════════════════════════════════${PLAIN}"
-    echo -e "${BLUE}${BOLD}  Shadowsocks Rust - 中国大陆屏蔽${PLAIN}"
-    echo -e "${BLUE}${BOLD}════════════════════════════════════${PLAIN}"
-    echo ""
-    echo -e "  ${BOLD}1.${PLAIN} 下载IP列表并启用屏蔽"
-    echo -e "  ${BOLD}2.${PLAIN} 启用屏蔽规则"
-    echo -e "  ${BOLD}3.${PLAIN} 禁用屏蔽规则"
-    echo -e "  ${BOLD}4.${PLAIN} 更新IP列表"
-    echo -e "  ${BOLD}5.${PLAIN} 查看规则状态"
-    echo -e "  ${BOLD}6.${PLAIN} 开启定时更新"
-    echo -e "  ${BOLD}7.${PLAIN} 关闭定时更新"
-    echo -e "  ${BOLD}8.${PLAIN} 查看定时更新状态"
-
-    echo -e "  ${BOLD}0.${PLAIN} 退出"
-    echo ""
-}
-
-# 主函数
-main() {
-    check_root
-    
-    # 如果有参数，直接执行相应操作
-    if [ $# -gt 0 ]; then
-        case "$1" in
-            enable)
-                check_dependencies
-                create_directories
-                download_mainland_ip_list
-                generate_iptables_rules
-                generate_import_script
-                enable_blocking
-                show_status
-                ;;
-            disable)
-                disable_blocking
-                show_status
-                ;;
-            update)
-                check_dependencies
-                update_ip_list
-                show_status
-                ;;
-            auto-update-enable)
-                check_dependencies
-                create_directories
-                enable_auto_update "$2"
-                show_auto_update_status
-                ;;
-            auto-update-disable)
-                disable_auto_update
-                show_auto_update_status
-                ;;
-            auto-update-status)
-                show_auto_update_status
-                ;;
-            status)
-                show_status
-                ;;
-            *)
-                echo "用法: $SCRIPT_NAME [enable|disable|update|status|auto-update-enable [daily|weekly|\"cron\"]|auto-update-disable|auto-update-status]"
-                exit 1
-                ;;
-        esac
-        return 0
-    fi
-    
-    # 交互式菜单
+bm_menu() {
+    local c s
     while true; do
-        show_menu
-        read -p "请选择操作 [0-8]: " choice
-        
-        case $choice in
-            1)
-                check_dependencies
-                create_directories
-                download_mainland_ip_list && {
-                    generate_iptables_rules
-                    generate_import_script
-                    enable_blocking
-                    show_status
-                }
-                ;;
-            2)
-                check_directories
-                enable_blocking
-                show_status
-                ;;
-            3)
-                disable_blocking
-                show_status
-                ;;
-            4)
-                check_dependencies
-                update_ip_list
-                ;;
-            5)
-                show_status
-                ;;
-            6)
-                check_dependencies
-                create_directories
-                enable_auto_update
-                show_auto_update_status
-                ;;
-            7)
-                disable_auto_update
-                show_auto_update_status
-                ;;
-            8)
-                show_auto_update_status
-                ;;
-            0)
-                echo -e "${INFO} 退出脚本"
-                exit 0
-                ;;
-            *)
-                echo -e "${ERROR} 无效的选择"
-                ;;
+        ui_sub "屏蔽中国大陆的连接：$(bm_active && echo 已启用 || echo 未启用)" \
+            "下载 IP 库并启用" "停用" "更新 IP 库" "查看状态" "定时更新 IP 库" "关闭定时更新"
+        ui_read c || return 0
+        case "$c" in
+            1) bm_enable; bm_status ;;
+            2) bm_disable ;;
+            3) bm_update ;;
+            4) bm_status ;;
+            5) ui_read s "每天还是每周？[daily/weekly]（回车 daily）: " || continue
+               bm_self; bm_auto_update_enable "${s:-daily}" ;;
+            6) bm_auto_update_disable ;;
+            0|"") return 0 ;;
+            *) ui_err "无效的选择" ;;
         esac
-        
-        read -p "按 Enter 键继续..."
     done
 }
 
-# 辅助函数：检查目录
-check_directories() {
-    if [ ! -d "$IPLIST_DIR" ]; then
-        echo -e "${ERROR} IP列表目录不存在，请先运行初始化"
-        exit 1
-    fi
-}
-
-# 启动主函数
-main "$@"
+check_root
+case "${1:-}" in
+    enable) bm_enable && bm_status ;;
+    disable) bm_disable ;;
+    update) bm_update ;;
+    status) bm_status ;;
+    auto-update-enable) bm_self; bm_auto_update_enable "${2:-daily}" ;;
+    auto-update-disable) bm_auto_update_disable ;;
+    auto-update-status) echo "定时更新：$(bm_auto_update_state)" ;;
+    "") bm_menu ;;
+    *) echo "用法: $0 [enable|disable|update|status|auto-update-enable [daily|weekly]|auto-update-disable|auto-update-status]"; exit 1 ;;
+esac
